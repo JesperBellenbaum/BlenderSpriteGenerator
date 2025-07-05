@@ -1,8 +1,8 @@
 bl_info = {
     "name": "2D/2.5D Sprite Renderer",
-    "description": "Automatically renders a character from multiple angles for use in 2D or 2.5D games",
-    "author": "Rubiel",
-    "version": (1, 1),
+    "description": "Renders multi-angle sprites with roll control for 2D/2.5D game development",
+    "author": "Rubiel + enhanced",
+    "version": (1, 3, 0),
     "blender": (3, 4, 0),
     "location": "View3D > Sidebar > Sprite Renderer Panel",
     "category": "Object",
@@ -10,8 +10,53 @@ bl_info = {
 
 import bpy
 import os
-from math import cos, sin, tan, atan
+import math
+from math import cos, sin, tan
 from mathutils import Vector
+
+
+def bbox_center_and_size(obj):
+    """Return (world-space centre, height) of obj's bounding box."""
+    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    bb_min = Vector((min(c.x for c in corners),
+                     min(c.y for c in corners),
+                     min(c.z for c in corners)))
+    bb_max = Vector((max(c.x for c in corners),
+                     max(c.y for c in corners),
+                     max(c.z for c in corners)))
+    centre = (bb_min + bb_max) * 0.5
+    height = bb_max.z - bb_min.z
+    return centre, height
+
+
+def ensure_output_nodes(scene, outdir, basename):
+    """Create or reuse File Output nodes for N(ormal) and Z(depth)."""
+    if not scene.node_tree:
+        scene.use_nodes = True
+    nt = scene.node_tree
+
+    # Idempotent: only add once
+    if "SPRITE_OUT_NORMAL" not in nt.nodes:
+        rl = nt.nodes.new("CompositorNodeRLayers")
+        rl.name = "SPRITE_RLAYERS"
+
+        for tag, label, depth in (("N", "Normal", 8), ("Z", "Depth", 16)):
+            out = nt.nodes.new("CompositorNodeOutputFile")
+            out.name = f"SPRITE_OUT_{label.upper()}"
+            out.base_path = outdir
+            out.format.file_format = 'PNG'          # PNG for both normal and depth
+            out.format.color_depth = str(depth)     # 8-bit for normals, 16-bit for depth
+            nt.links.new(rl.outputs[label], out.inputs[0])
+    return nt
+
+
+def update_output_node_paths(nt, base, yaw_i, roll_i, frame):
+    """Update File Output node paths for each pass."""
+    tag = f"{yaw_i:02d}_{roll_i:02d}"
+    if frame is not None:
+        tag += f"_F{frame:03d}"
+    nt.nodes["SPRITE_OUT_NORMAL"].file_slots[0].path = f"{base}_N_{tag}"
+    nt.nodes["SPRITE_OUT_DEPTH"].file_slots[0].path = f"{base}_Z_{tag}"
 
 
 class CharacterSpriteRenderer(bpy.types.Operator):
@@ -33,12 +78,33 @@ class CharacterSpriteRenderer(bpy.types.Operator):
         frame_start = scene.frame_start
         frame_end = scene.frame_end
 
+        # Enable normal and depth passes
+        view_layer = scene.view_layers[0]
+        view_layer.use_pass_normal = True     # surface normals
+        view_layer.use_pass_z = True          # linear depth
+
+        # Set up compositor nodes for multi-pass rendering
+        nt = ensure_output_nodes(scene, output_folder, basename)
 
         if camera_path == "":
+            # Get the selected object (sprite root) and calculate its center
+            if context.selected_objects:
+                subject = context.selected_objects[0]
+                pivot, character_height = bbox_center_and_size(subject)
+                bb_size = subject.dimensions  # world-space size vec
+                largest = max(bb_size.x, bb_size.y, bb_size.z)
+                orig_rot = subject.rotation_euler.copy()
+            else:
+                self.report({'ERROR'}, "Select the object to render first.")
+                return {'CANCELLED'}
+            
             # Getting properties from the scene
-            character_position = Vector((0, 0, 0)) 
-            character_height = context.scene.sprite_renderer.character_height
             number_of_angles = context.scene.sprite_renderer.number_of_angles
+            
+            # Get roll properties
+            roll_steps = context.scene.sprite_renderer.roll_steps
+            roll_min_deg = context.scene.sprite_renderer.roll_min
+            roll_max_deg = context.scene.sprite_renderer.roll_max
 
             scene.render.resolution_x = int(context.scene.sprite_renderer.resolution)
             scene.render.resolution_y = int(context.scene.sprite_renderer.resolution)
@@ -53,53 +119,83 @@ class CharacterSpriteRenderer(bpy.types.Operator):
                 camera = bpy.data.objects[camera_name]
             else:
                 # Add a new camera to the scene
-                bpy.ops.object.camera_add(location=character_position)
+                bpy.ops.object.camera_add(location=pivot)
                 camera = bpy.context.object  # the newly added camera becomes the active object
                 camera.name = camera_name  # set the camera name
             scene.camera = camera
 
             if camera_type == 'ORTHO':
+                margin = context.scene.sprite_renderer.distance_factor  # reuse the knob
                 camera.data.type = 'ORTHO'
-                camera.data.ortho_scale = character_height * 1.1
+                camera.data.ortho_scale = largest * margin  # uses largest dimension
             else:
                 camera.data.type = 'PERSP'
 
+            # Apply camera shift if specified
+            camera.data.shift_y = context.scene.sprite_renderer.camera_shift_y
+
             if perspective == '2D':
-                distance = 10
+                distance = 10 * context.scene.sprite_renderer.distance_factor
                 z_distance = 0
             else:
-                distance = 0.5 * character_height / tan(0.5 * atan(0.5 * camera.data.sensor_height / camera.data.lens))
+                # Proper fit-to-height formula for perspective mode
+                sensor_h = camera.data.sensor_height
+                focal = camera.data.lens
+                fov = 2 * math.atan((sensor_h * 0.5) / focal)  # radians
+                base_distance = (character_height * 0.5) / math.tan(fov * 0.5)
+                distance = base_distance * context.scene.sprite_renderer.distance_factor
                 camera_angle_rad = context.scene.sprite_renderer.camera_angle * 3.14159 / 180  # converting to radians
                 z_distance = distance * tan(camera_angle_rad)
 
-            # Loop to set the camera's position and render the scene
-            for i in range(number_of_angles):
-                angle = i * (2.0 * 3.14159 / number_of_angles)  # calculate angle
+            # Nested rendering loops: roll × yaw × frame
+            for ri in range(roll_steps):
+                # compute roll (pitch) in radians; -ve = downhill
+                roll_deg = roll_min_deg + (roll_max_deg - roll_min_deg) * ri / (roll_steps - 1)
+                roll_rad = roll_deg * 3.14159 / 180.0
 
-                # Set the camera's position
-                camera.location.x = character_position.x + distance * cos(angle)
-                camera.location.y = character_position.y + distance * sin(angle)
-                camera.location.z = character_position.z + (character_height / 2) + z_distance
+                # tilt the model, *not* the camera, so shadows etc. follow the mesh
+                subject.rotation_euler[0] = orig_rot[0] + roll_rad
 
-                # Point the camera to the character
-                direction = Vector((character_position.x, character_position.y, character_position.z + (character_height / 2))) - camera.location
-                camera.rotation_mode = 'QUATERNION'
-                camera.rotation_quaternion = direction.to_track_quat('-Z', 'Y')  # camera looks towards the character
+                for yi in range(number_of_angles):
+                    angle = yi * (2.0 * 3.14159 / number_of_angles)  # calculate angle
 
-                # Check if there is animation
-                if include_animation and frame_start != frame_end:
-                    # Loop through every frame of the animation
-                    for frame in range(frame_start, frame_end + 1, frame_step):
-                        scene.frame_set(frame)
-                        # Set output path
-                        scene.render.filepath = os.path.join(output_folder, '{}_angle{}_frame{:03}.png'.format(basename, i, frame))
+                    # Set the camera's position relative to the object's center
+                    camera.location.x = pivot.x + distance * cos(angle)
+                    camera.location.y = pivot.y + distance * sin(angle)
+                    camera.location.z = pivot.z + z_distance
+
+                    # Point the camera to the object's center
+                    direction = pivot - camera.location
+                    camera.rotation_mode = 'QUATERNION'
+                    camera.rotation_quaternion = direction.to_track_quat('-Z', 'Y')  # camera looks towards the object center
+
+                    # Check if there is animation
+                    if include_animation and frame_start != frame_end:
+                        # Loop through every frame of the animation
+                        for frame in range(frame_start, frame_end + 1, frame_step):
+                            scene.frame_set(frame)
+                            # Set output path
+                            col_path = os.path.join(
+                                output_folder,
+                                f"{basename}_C_{yi:02d}_{ri:02d}_F{frame:03}.png"
+                            )
+                            scene.render.filepath = col_path
+                            update_output_node_paths(nt, basename, yi, ri, frame)
+                            # Render the scene
+                            bpy.ops.render.render(write_still=True)
+                    else:
+                        # Handle static scene (no animation)
+                        col_path = os.path.join(
+                            output_folder,
+                            f"{basename}_C_{yi:02d}_{ri:02d}.png"
+                        )
+                        scene.render.filepath = col_path
+                        update_output_node_paths(nt, basename, yi, ri, None)
                         # Render the scene
-                        bpy.ops.render.render(write_still = True)
-                else:
-                    # Handle static scene (no animation)
-                    scene.render.filepath = os.path.join(output_folder, '{}_angle{}.png'.format(basename, i))
-                    # Render the scene
-                    bpy.ops.render.render(write_still = True)
+                        bpy.ops.render.render(write_still=True)
+
+            # Restore original rotation
+            subject.rotation_euler = orig_rot
 
             bpy.data.objects.remove(camera, do_unlink=True)
         else:
@@ -153,14 +249,26 @@ class SpriteRendererPanel(bpy.types.Panel):
         # Adding a label for the subsection
         camera_box.label(text="Camera Settings")
 
-        camera_box.prop(renderer, "character_height")
         camera_box.prop(renderer, "number_of_angles")
+        camera_box.prop(renderer, "distance_factor")
+        
+        row = camera_box.row(align=True)
+        row.enabled = (renderer.perspective == '2.5D')
+        row.prop(renderer, "roll_steps")
+        row = camera_box.row(align=True)
+        row.enabled = (renderer.perspective == '2.5D')
+        row.prop(renderer, "roll_min")
+        row.prop(renderer, "roll_max")
 
         camera_box.prop(renderer, "perspective")
 
         row = camera_box.row()
         row.enabled = (renderer.perspective == '2.5D')
         row.prop(renderer, "camera_angle")
+        
+        row = camera_box.row()
+        row.enabled = (renderer.perspective == '2.5D')
+        row.prop(renderer, "camera_shift_y")
 
         camera_box.prop(renderer, "camera_type")
         camera_box.prop(renderer, "resolution")
@@ -188,8 +296,31 @@ class SpriteRendererProperties(bpy.types.PropertyGroup):
         description="Render every n-th frame of the animation. For example, if set to 3, only every third frame will be rendered.",
     )
 
-    character_height: bpy.props.FloatProperty(name="Character Height", default=2.0)
     number_of_angles: bpy.props.IntProperty(name="Number of Angles", default=8)
+    distance_factor: bpy.props.FloatProperty(
+        name="Distance Factor", 
+        default=1.2, 
+        min=0.1, 
+        max=20.0,
+        description="Camera distance multiplier - higher values move camera further away (1.2 = 20% margin)"
+    )
+    
+    roll_steps: bpy.props.IntProperty(
+        name="Roll Slices",
+        default=5, min=2,
+        description="How many tilt angles (top-to-bottom) to render"
+    )
+    roll_min: bpy.props.FloatProperty(
+        name="Roll Min °",
+        default=-15.0, min=-89.0, max=0.0,
+        description="Lowest tilt (downhill)"
+    )
+    roll_max: bpy.props.FloatProperty(
+        name="Roll Max °",
+        default=15.0, min=0.0, max=89.0,
+        description="Highest tilt (uphill)"
+    )
+    
     perspective: bpy.props.EnumProperty(
         name="Perspective",
         description="Select Perspective type",
@@ -200,6 +331,13 @@ class SpriteRendererProperties(bpy.types.PropertyGroup):
         default='2.5D',
     )
     camera_angle: bpy.props.FloatProperty(name="Camera Angle", default=30.0, min=0.0, max=89.0)
+    camera_shift_y: bpy.props.FloatProperty(
+        name="Cam Shift Y", 
+        default=0.0, 
+        min=-2.0, 
+        max=2.0,
+        description="Vertical camera shift - positive moves view down"
+    )
     camera_type: bpy.props.EnumProperty(
         name="Camera Type",
         description="Select Camera type",
